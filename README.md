@@ -24,7 +24,7 @@ NtCreateSection() -> Memory Mirroring -> APC Execution
 - No remote memory writes or thread creation
 - Appears as normal process startup to EDRs
 
-## 🔧 Technique Overview
+## Technique Overview
 
 This PoC uses the following Windows syscalls:
 
@@ -37,7 +37,7 @@ This PoC uses the following Windows syscalls:
 
 ---
 
-## ✅ Features
+## Features
 
 - Process Continuity Preservation (Maintains original security tokens and handles, preserves parent-child process relationships, keeps PEB structure intact, no impersonation or token stealing required)
 - Cross-Process Memory Mirroring
@@ -61,7 +61,7 @@ No module stomping or hollowing patterns
 Memory appears as legitimate image mapping
 
 
-## 📊 Comparison with Existing Techniques
+##  Comparison with Existing Techniques
 
 Comparison with Existing Techniques
 
@@ -99,7 +99,7 @@ Thread Hijacking
 
 ---
 
-## 💡 Notes
+## Notes
 
 - Payload must be a valid PE file (e.g. raw `exe`) smaller than 2MB
 - Target binary must exist (e.g. `notepad.exe`)
@@ -107,7 +107,7 @@ Thread Hijacking
 
 ---
 
-## 📎 Disclaimer
+##  Disclaimer
 
 This code is for educational and research purposes only.
 
