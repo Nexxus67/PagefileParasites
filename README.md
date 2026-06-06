@@ -1,120 +1,105 @@
 # Pagefile Parasites
 
-**ParasiteView** introduces a process injection technique that swaps the entire address space of a suspended process with a malicious payload while preserving the process execution context. Unlike traditional injection methods that write foreign code into existing memory, ParasiteView leverages named sections and APC queuing to achieve execution continuity that appears identical to legitimate process initialization.
+Lab-safe demonstration of **section-backed payload execution** for internal BAS
+presentations.
 
----
+This version is intentionally constrained: it demonstrates a minimal PE32+
+manual mapping flow for a benign stub payload, with clear validation and failure
+messages. It does not claim stealth or evasion properties.
 
-## What's new
+## What It Demonstrates
 
-Memory Swapping vs Traditional Injection
+- Creates a pagefile-backed section sized to `OptionalHeader.SizeOfImage`.
+- Maps that section into the local process and a suspended target process.
+- Builds a PE in-memory image layout instead of copying the raw on-disk file:
+  - copies headers to image base offset `0`;
+  - copies each section from `PointerToRawData` to `VirtualAddress`;
+  - leaves BSS/zero-fill areas zeroed when `VirtualSize > SizeOfRawData`;
+  - validates section bounds against `SizeOfImage`.
+- Queues execution to `RemoteBase + AddressOfEntryPoint`.
+- Defaults the target process to `C:\Windows\System32\notepad.exe`, configurable
+  with `-TargetBinary`.
 
-Traditional Process Injection:
+## Usage
 
-WriteProcessMemory() -> CreateRemoteThread()
-- Modifies existing process memory
-- Creates anomalous threads
-- Leaves clear forensic artifacts
-- Easily detected by modern EDRs
+Validate only, without process creation:
 
-ParasiteView (Memory Swapping):
+```powershell
+.\pagefile_parasites.ps1 -PayloadPath .\payload.exe -ValidateOnly
+```
 
-NtCreateSection() -> Memory Mirroring -> APC Execution
-- Swaps entire address space via named sections
-- Preserves process context (tokens, handles, PEB)
-- No remote memory writes or thread creation
-- Appears as normal process startup to EDRs
+Run the lab demo:
 
-## Technique Overview
+```powershell
+.\pagefile_parasites.ps1 -PayloadPath .\payload.exe -TargetBinary C:\Windows\System32\notepad.exe
+```
 
-This PoC uses the following Windows syscalls:
+## Payload Contract
 
-- `NtCreateSection` with `SEC_COMMIT`, Pagefile-backed named extension
-- `NtMapViewOfSection` mirror same phisycal memory in two processes
-- `NtMapViewOfSection` remove original process image 
-- `NtQueueApcThread` execute via asynchronous procedure call
-- `NtUnmapViewOfSection` -> unmap original image
-- `GetThreadContext` -> preserve execution state for fallback
+This is **minimal PE manual mapping**, not shellcode execution and not a full
+Windows loader. The payload must be:
 
----
+- PE32+ (`OptionalHeader.Magic == 0x20B`);
+- architecture-matched to the host process (`AMD64` or `ARM64`);
+- benign and deterministic;
+- no-import, because import resolution is intentionally not implemented;
+- relocatable if Windows maps the section away from `OptionalHeader.ImageBase`.
 
-## Features
+If the payload contains imports, the script fails clearly before process
+creation. If the payload maps at a non-preferred base and has no relocation
+directory, the script fails clearly because relocations are required.
 
-- Process Continuity Preservation (Maintains original security tokens and handles, preserves parent-child process relationships, keeps PEB structure intact, no impersonation or token stealing required)
-- Cross-Process Memory Mirroring
-(
-    // Same physical memory, two virtual mappings
-Section = NtCreateSection(Named);
-NtMapViewOfSection(Section, LocalProcess, &LocalBase);
-NtMapViewOfSection(Section, RemoteProcess, &RemoteBase);
+## Sample Benign Payload Build
 
-)
-- Timed based evation
+Example no-import x64 stub with MSVC tools. It exits with code `42`.
 
-Random delay (3-10s) between process creation and memory swap
-Process appears "legitimately suspended" during delay
-Memory swap and execution happen instantaneously post-delay
+```cmd
+ml64 /c benign_exit.asm
+link /subsystem:windows /entry:Start /nodefaultlib /dynamicbase /out:payload.exe benign_exit.obj
+```
 
-- EDR-unfriendly by design:
-No VirtualAllocEx or WriteProcessMemory calls
-No remote thread creation via CreateRemoteThread
-No module stomping or hollowing patterns
-Memory appears as legitimate image mapping
+`benign_exit.asm`:
 
+```asm
+option casemap:none
 
-##  Comparison with Existing Techniques
+.code
+Start proc
+    mov eax, 42
+    ret
+Start endp
+end
+```
 
-Comparison with Existing Techniques
+For a marker-file payload, use a normal imported executable instead and keep it
+outside this mapper, or extend the lab with explicit import resolution. This
+demo intentionally rejects imported payloads.
 
-Process Hollowing
-- Detection vectors:
-  * Unmap/Map memory pattern
-  * Modified PEB
-- ParasiteView evasion:
-  ✓ Uses shared sections
-  ✓ Preserves original PEB
+## Self-Test Mode
 
-APC Injection
-- Detection vectors:
-  * QueueUserAPC hooks
-  * Reliance on alertable threads
-- ParasiteView evasion:
-  ✓ Uses NtQueueApcThread directly
-  ✓ Does not require alertable state
+`-ValidateOnly` performs deterministic validation and exits before target
+process creation:
 
-Module Stomping
-- Detection vectors:
-  * Modified loaded modules
-  * LDR list inconsistencies
-- ParasiteView evasion:
-  ✓ No module stomping
-  ✓ No LDR list modifications
+- payload architecture;
+- DOS, NT, COFF, and PE32+ OptionalHeader fields;
+- `SizeOfHeaders`, `SizeOfImage`, `ImageBase`, `AddressOfEntryPoint`;
+- `SectionAlignment` and `FileAlignment`;
+- section raw-to-virtual mapping bounds;
+- computed entrypoint VA at the preferred image base;
+- non-empty Import Directory rejection.
 
-Thread Hijacking
-- Detection vectors:
-  * Suspicious thread context changes
-  * Direct RIP/EIP patching
-- ParasiteView evasion:
-  ✓ Execution via legitimate APC delivery
-  ✓ No direct thread context overwrite
+## Known Unsupported
 
----
+- TLS callbacks.
+- Complex imports and delayed imports.
+- SEH and unwinding edge cases.
+- ARM64 runtime behavior if not explicitly tested in your lab.
+- Non-relocatable images when mapped away from `OptionalHeader.ImageBase`.
+- Normal `.exe` payloads that rely on the Windows loader for imports, CRT
+  startup, TLS, loader lists, activation contexts, or subsystem setup.
 
-## Notes
+## Safety Scope
 
-- Payload must be a valid PE file (e.g. raw `exe`) smaller than 2MB
-- Target binary must exist (e.g. `notepad.exe`)
-- EntryPoint is extracted from the PE header manually
-
----
-
-##  Disclaimer
-
-This code is for educational and research purposes only.
-
----
-
-by **@nexxus67**, 2025
-
-"The art of stealth lies not in hiding, but in appearing as something you're not."
-
-
+This repository is for controlled internal lab education only. The script does
+not include stealth, evasion, AMSI/ETW patching, obfuscation, persistence,
+credential access, network callbacks, random sleeps, or anti-analysis behavior.
