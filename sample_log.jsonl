@@ -1,0 +1,8 @@
+{"timestamp":"2026-04-14T20:35:00.123Z","event_type":"payload_info","data":{"image_base":"0x100000000","entry_point_rva":"0x1000","size_bytes":4096}}
+{"timestamp":"2026-04-14T20:35:00.456Z","event_type":"section_created","data":{"section_name":"\\BaseNamedObjects\Windows_SharedMemory_1234","section_handle":140737488355328,"size":2097152}}
+{"timestamp":"2026-04-14T20:35:00.789Z","event_type":"local_mapping","data":{"base_address":"0x100000000","size":2097152}}
+{"timestamp":"2026-04-14T20:35:01.012Z","event_type":"process_created","data":{"process_id":1234,"thread_id":5678,"process_handle":140737488355329,"thread_handle":140737488355330}}
+{"timestamp":"2026-04-14T20:35:01.345Z","event_type":"remote_image_base","data":{"base_address":"0x7ff600000000"}}
+{"timestamp":"2026-04-14T20:35:02.123Z","event_type":"remote_mapping","data":{"base_address":"0x7ff600000000","size":2097152}}
+{"timestamp":"2026-04-14T20:35:05.456Z","event_type":"apc_queued","data":{"target_address":"0x7ff600001000","thread_id":5678}}
+{"timestamp":"2026-04-14T20:35:05.789Z","event_type":"thread_resumed","data":{"thread_id":5678}}
